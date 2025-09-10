@@ -1,0 +1,107 @@
+# Azure DevOps Pipeline for Ice Cream Parlour
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+  buildConfiguration: 'Release'
+  azureSubscription: 'Azure-Subscription-Connection'
+  resourceGroupName: 'ice-cream-parlour-rg'
+  webAppName: 'ice-cream-parlour-app'
+  containerRegistry: 'icecreamparlour.azurecr.io'
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: 'Install Node.js'
+    
+    - script: |
+        npm install -g @angular/cli
+        npm install -g @azure/cli
+      displayName: 'Install global packages'
+    
+    - script: |
+        cd backend
+        npm ci
+        npm run build
+      displayName: 'Build Backend'
+    
+    - script: |
+        cd frontend
+        npm ci
+        npm run build
+      displayName: 'Build Frontend'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(System.DefaultWorkingDirectory)'
+        artifactName: 'drop'
+
+- stage: Deploy
+  displayName: 'Deploy to Azure'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployJob
+    displayName: 'Deploy'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webApp'
+              appName: '$(webAppName)'
+              package: '$(Pipeline.Workspace)/drop'
+              deploymentMethod: 'zipDeploy'
+
+- stage: DeployInfrastructure
+  displayName: 'Deploy Infrastructure'
+  jobs:
+  - job: DeployInfraJob
+    displayName: 'Deploy Infrastructure'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Create Resource Group
+          az group create --name $(resourceGroupName) --location eastus
+          
+          # Create App Service Plan
+          az appservice plan create --name ice-cream-plan --resource-group $(resourceGroupName) --sku B1 --is-linux
+          
+          # Create Web App
+          az webapp create --resource-group $(resourceGroupName) --plan ice-cream-plan --name $(webAppName) --runtime "NODE|18-lts"
+          
+          # Create Cosmos DB (MongoDB API)
+          az cosmosdb create --name ice-cream-db --resource-group $(resourceGroupName) --kind MongoDB
+          
+          # Create Storage Account
+          az storage account create --name icecreamstorage --resource-group $(resourceGroupName) --location eastus --sku Standard_LRS
+          
+          # Configure App Settings
+          az webapp config appsettings set --resource-group $(resourceGroupName) --name $(webAppName) --settings \
+            NODE_ENV=production \
+            MONGODB_URI="mongodb://ice-cream-db:$(az cosmosdb keys list --name ice-cream-db --resource-group $(resourceGroupName) --query primaryMasterKey -o tsv)@ice-cream-db.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb" \
+            JWT_SECRET="$(openssl rand -base64 32)" \
+            CORS_ORIGIN="https://$(webAppName).azurewebsites.net"
